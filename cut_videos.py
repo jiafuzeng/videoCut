@@ -632,6 +632,7 @@ def cut_segment_without_end(video_path, cut_duration, output_dir, num_segments, 
     对单个视频片段进行切分，不添加结尾视频
     """
     video_duration = get_video_duration(video_path)
+    video_name = Path(video_path).stem
     
     # 切分视频
     for i in range(num_segments):
@@ -647,7 +648,8 @@ def cut_segment_without_end(video_path, cut_duration, output_dir, num_segments, 
             print(f"[TID {tid}] 跳过: segment_{i+1:03d}.mp4 (切分时长太短: {end_time - start_time:.2f}s)")
             continue
 
-        output_filename = f"segment_{i+1:03d}.mp4"
+        # 生成唯一文件名，避免多线程冲突
+        output_filename = f"{video_name}_segment_{i+1:03d}.mp4"
         output_path = os.path.join(output_dir, output_filename)
 
         success = cut_single_segment_without_end(video_path, start_time, end_time, output_path)
@@ -662,6 +664,7 @@ def cut_segment_with_end(video_path, cut_duration, end_video_path, output_dir, n
     对单个视频片段进行切分并添加结尾视频
     """
     video_duration = get_video_duration(video_path)
+    video_name = Path(video_path).stem
     
     # 预处理结尾视频（循环外一次），按主视频分辨率/参数
     try:
@@ -718,7 +721,8 @@ def cut_segment_with_end(video_path, cut_duration, end_video_path, output_dir, n
                 print(f"[TID {tid}] 跳过: segment_{i+1:03d}.mp4 (切分时长太短: {end_time - start_time:.2f}s)")
                 continue
 
-            output_filename = f"segment_{i+1:03d}.mp4"
+            # 生成唯一文件名，避免多线程冲突
+            output_filename = f"{video_name}_segment_{i+1:03d}.mp4"
             output_path = os.path.join(output_dir, output_filename)
 
             success = cut_single_segment_with_end(video_path, start_time, end_time, output_path, prepared_end_path, end_duration)
@@ -735,9 +739,8 @@ def process_video(video_path, cut_duration, end_video_path, output_dir, global_m
     video_name = Path(video_path).stem
     tid = threading.get_ident()
     
-    # 创建视频输出目录
-    video_output_dir = os.path.join(output_dir, video_name)
-    os.makedirs(video_output_dir, exist_ok=True)
+    # 直接使用输出目录，不创建子目录
+    video_output_dir = output_dir
     
     # 处理JSON配置
     merged_segments = global_merged_segments
@@ -825,6 +828,7 @@ class VideoCutNode(ComfyNodeABC):
             },
             "optional": {
                 "end_video": ([""] + sorted(video_files), {"default": "", "video_upload": True, "tooltip": "结尾视频文件（可选）"}),
+                "custom_input_path": (IO.STRING, {"default": "", "tooltip": "自定义输入文件夹路径，优先级高于下拉框选择"}),
             }
         }
     
@@ -833,11 +837,22 @@ class VideoCutNode(ComfyNodeABC):
     FUNCTION = "execute"
     OUTPUT_NODE = True
     
-    def execute(self, input_folder: str, cut_duration: float, output_folder: str, max_workers: int, end_video: str = ""):
+    def execute(self, input_folder: str, cut_duration: float, output_folder: str, max_workers: int, end_video: str = "", custom_input_path: str = ""):
         """执行视频切分处理"""
         try:
-            # 解析输入路径
-            input_folder_path = _resolve_input_path(input_folder)
+            # 解析输入路径（自定义路径优先级更高）
+            if custom_input_path and custom_input_path.strip():
+                # 使用自定义路径
+                input_folder_path = custom_input_path.strip()
+                print(f"使用自定义输入路径: {input_folder_path}")
+            else:
+                # 使用下拉框选择的路径
+                input_folder_path = _resolve_input_path(input_folder)
+                print(f"使用下拉框选择的路径: {input_folder_path}")
+            
+            # 验证输入路径是否存在
+            if not os.path.exists(input_folder_path):
+                return (f"错误: 输入文件夹不存在: {input_folder_path}",)
             
             # 处理结尾视频（可选）
             end_video_path = None
@@ -848,8 +863,7 @@ class VideoCutNode(ComfyNodeABC):
             
             # 创建输出目录
             output_dir = folder_paths.get_output_directory()
-            folder_name = Path(input_folder_path).name
-            batch_output_dir = os.path.join(output_dir, output_folder, folder_name)
+            batch_output_dir = os.path.join(output_dir, output_folder)
             os.makedirs(batch_output_dir, exist_ok=True)
             
             # 使用常规处理模式（自动检测JSON配置）
@@ -870,40 +884,15 @@ class VideoCutNode(ComfyNodeABC):
             # 执行批量视频处理
             process_videos_folder(input_folder_path, cut_duration, end_video_path, batch_output_dir, max_workers, merged_segments)
             
-            # 统计输出文件
-            total_output_files = 0
-            processed_videos = 0
-            if os.path.exists(batch_output_dir):
-                for subdir in os.listdir(batch_output_dir):
-                    subdir_path = os.path.join(batch_output_dir, subdir)
-                    if os.path.isdir(subdir_path):
-                        processed_videos += 1
-                        for file in os.listdir(subdir_path):
-                            if file.endswith('.mp4'):
-                                total_output_files += 1
-            
-            result_info = f"批量处理完成！\n"
-            result_info += f"输入文件夹: {input_folder}\n"
-            result_info += f"切分时长: {cut_duration} 秒\n"
-            if end_video_path:
-                result_info += f"结尾视频: {end_video}\n"
-            else:
-                result_info += f"结尾视频: 无\n"
-            result_info += f"处理视频数: {processed_videos}\n"
-            result_info += f"输出文件总数: {total_output_files}\n"
-            result_info += f"输出目录: {batch_output_dir}\n"
-            print(result_info)
-            
             return (batch_output_dir,)
             
         except ValueError as e:
             # 输入验证错误
-            return (f"输入错误: {str(e)}",)
+            return ("",)
         except Exception as e:
             # 其他错误
-            error_msg = f"处理视频时发生错误: {str(e)}"
-            print(error_msg)
-            return (error_msg,)
+            print(f"处理视频时发生错误: {str(e)}")
+            return ("",)
 
 
 class VideoJsonProcessNode(ComfyNodeABC):
@@ -1136,11 +1125,9 @@ def append_end_to_videos_folder(input_folder, end_video_path, output_dir, max_wo
         future_to_video = {}
         for video_file, relative_path in video_files:
             # 创建对应的输出子目录
-            output_subdir = os.path.join(output_dir, relative_path)
-            os.makedirs(output_subdir, exist_ok=True)
             
             print(f"[TID {tid_main}] 提交任务: {relative_path / Path(video_file).name}")
-            future = executor.submit(append_end_to_single_video, video_file, end_video_path, output_subdir)
+            future = executor.submit(append_end_to_single_video, video_file, end_video_path, output_dir)
             future_to_video[future] = (video_file, relative_path)
         
         # 等待所有任务完成
