@@ -10,6 +10,7 @@ from datetime import datetime
 from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict
 import folder_paths
 from comfy_api.input_impl import VideoFromFile
+import random
 
 
 def _get_input_directory_files():
@@ -1253,15 +1254,280 @@ def append_end_to_single_video(video_path, end_video_path, output_dir):
             except:
                 pass
         return False
+
+
+def prepend_start_to_videos_folder(input_folder, start_video_path, output_dir, max_workers=4):
+    """
+    为文件夹中的所有视频添加开始视频，保持目录结构
+    """
+    # 支持的视频格式
+    video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.m4v']
+    
+    # 递归获取所有视频文件，保持相对路径
+    video_files = []
+    input_folder_path = Path(input_folder)
+    
+    for root, dirs, files in os.walk(input_folder):
+        root_path = Path(root)
+        for file in files:
+            if any(file.lower().endswith(ext) for ext in video_extensions):
+                file_path = os.path.join(root, file)
+                # 确保是文件而不是目录
+                if os.path.isfile(file_path):
+                    # 计算相对于输入文件夹的路径
+                    relative_path = root_path.relative_to(input_folder_path)
+                    video_files.append((file_path, relative_path))
+    
+    if not video_files:
+        print(f"在文件夹 {input_folder} 中未找到视频文件")
+        return
+    
+    print(f"找到 {len(video_files)} 个视频文件")
+
+    
+    # 创建输出目录
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 获取开始视频文件夹中的所有视频文件
+    start_video_files = []
+    for file in os.listdir(start_video_path):
+        file_path = os.path.join(start_video_path, file)
+        if os.path.isfile(file_path) and any(file.lower().endswith(ext) for ext in ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.m4v']):
+            start_video_files.append(file_path)
+    
+    if not start_video_files:
+        print(f"开始视频文件夹中没有找到视频文件: {start_video_path}")
+        return
+    
+    print(f"找到 {len(start_video_files)} 个开始视频文件")
+    
+    # 使用线程池处理视频
+    tid_main = threading.get_ident()
+    print(f"[TID {tid_main}] 准备启动线程池，workers={max_workers}")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_video = {}
+        for i, (video_file, relative_path) in enumerate(video_files):
+            # 循环选择开始视频
+            start_video_index = i % len(start_video_files)
+            selected_start_video = start_video_files[start_video_index]
+            
+            print(f"[TID {tid_main}] 提交任务: {relative_path / Path(video_file).name} -> 使用开始视频: {os.path.basename(selected_start_video)}")
+            
+            future = executor.submit(prepend_start_to_single_video, video_file, selected_start_video, output_dir)
+            future_to_video[future] = (video_file, relative_path)
+        
+        # 等待所有任务完成
+        for future in as_completed(future_to_video):
+            video_file, relative_path = future_to_video[future]
+            try:
+                future.result()
+                print(f"[TID {tid_main}] 完成: {relative_path / Path(video_file).name}")
+            except Exception as e:
+                print(f"[TID {tid_main}] 处理视频时发生错误: {relative_path / Path(video_file).name}: {e}")
+    
+    print(f"批量添加开始视频完成！输出目录: {output_dir}")
+
+
+def prepend_start_to_single_video(video_path, start_video_path, output_dir):
+    """
+    为单个视频添加开始视频
+    """
+    video_name = Path(video_path).stem
+    tid = threading.get_ident()
+    
+    try:
+        # 检查文件是否存在且不是目录
+        if not os.path.isfile(video_path):
+            print(f"[TID {tid}] 跳过非文件路径: {video_path}")
+            return False
+            
+        # 获取主视频信息
+        try:
+            main_probe = ffmpeg.probe(video_path)
+            main_video_stream = next(s for s in main_probe['streams'] if s['codec_type'] == 'video')
+            main_width = int(main_video_stream['width'])
+            main_height = int(main_video_stream['height'])
+        except Exception as e:
+            print(f"[TID {tid}] 无法解析主视频 {video_path}: {e}")
+            return False
+        
+        #
+        # 获取开始视频信息
+        try:
+            start_probe = ffmpeg.probe(start_video_path)
+            start_duration = float(start_probe['streams'][0]['duration'])
+        except Exception as e:
+            print(f"[TID {tid}] 无法解析开始视频 {start_video_path}: {e}")
+            return False
+        
+        # 输出文件路径
+        output_filename = f"{video_name}_with_start.mp4"
+        output_path = os.path.join(output_dir, output_filename)
+        
+        # 使用临时文件来避免concat的复杂性
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_main = os.path.join(temp_dir, "temp_main.mp4")
+            prepared_start_path = os.path.join(temp_dir, "prepared_start.mp4")
+            
+            # 处理主视频
+            main_input_stream = ffmpeg.input(video_path, **{'fflags': '+ignidx+igndts'})
+            main_video_stream = main_input_stream.video.filter('scale', main_width, main_height, flags='lanczos').filter('setsar', '1')
+            main_audio_stream = main_input_stream.audio
+            
+            (
+                ffmpeg
+                .output(
+                    main_video_stream,
+                    main_audio_stream,
+                    temp_main,
+                    vcodec='libx264',
+                    preset='fast',
+                    **{'profile:v': 'main'},
+                    r=30,
+                    acodec='aac',
+                    ar=44100,
+                    ac=2,
+                    **{'fflags': '+ignidx+igndts'}
+                )
+                .overwrite_output()
+                .run(quiet=True)
+            )
+            
+            # 处理开始视频
+            start_input_stream = ffmpeg.input(start_video_path)
+            start_video_stream = start_input_stream.video.filter('scale', main_width, main_height, flags='lanczos').filter('setsar', '1')
+            start_audio_stream = start_input_stream.audio
+            
+            (
+                ffmpeg
+                .output(
+                    start_video_stream,
+                    start_audio_stream,
+                    prepared_start_path,
+                    vcodec='libx264',
+                    preset='fast',
+                    **{'profile:v': 'main'},
+                    r=30,
+                    acodec='aac',
+                    ar=44100,
+                    ac=2
+                )
+                .overwrite_output()
+                .run(quiet=True)
+            )
+            
+            # 合并开始视频和主视频（开始视频在前）
+            start_input = ffmpeg.input(prepared_start_path)
+            main_input = ffmpeg.input(temp_main)
+            
+            (
+                ffmpeg
+                .filter([start_input.video, start_input.audio, main_input.video, main_input.audio], 
+                       'concat', n=2, v=1, a=1)
+                .output(output_path, vcodec='libx264', acodec='aac')
+                .overwrite_output()
+                .run(quiet=True)
+            )
+        
+        # 验证最终视频时长
+        final_probe = ffmpeg.probe(output_path)
+        final_duration = float(final_probe['streams'][0]['duration'])
+        main_duration = float(main_probe['streams'][0]['duration'])
+        expected_duration = start_duration + main_duration
+        
+        print(f"[TID {tid}] 完成: {output_filename}")
+        print(f"[TID {tid}] 开始视频时长: {start_duration:.2f}s, 主视频时长: {main_duration:.2f}s, 最终时长: {final_duration:.2f}s")
+        
+        if abs(final_duration - expected_duration) > 0.1:  # 允许0.1秒误差
+            print(f"[TID {tid}] 警告: 时长不匹配! 期望: {expected_duration:.2f}s, 实际: {final_duration:.2f}s")
+        
+        return True
+        
+    except Exception as e:
+        print(f"[TID {tid}] 处理视频失败 {video_path}: {e}")
+        # 如果是ffmpeg错误，显示更详细的信息
+        if hasattr(e, 'stderr') and e.stderr:
+            try:
+                error_msg = e.stderr.decode('utf8')
+                print(f"[TID {tid}] FFmpeg错误详情: {error_msg}")
+            except:
+                pass
+        return False
+
+
+class VideoPrependStartNode(ComfyNodeABC):
+    """视频添加开始节点 - 为文件夹中的所有视频添加开始视频"""
+    
+    DESCRIPTION = "为文件夹中的所有视频添加开始视频，不进行切分操作"
+    CATEGORY = "video/processing"
+    
+    @classmethod
+    def INPUT_TYPES(cls) -> InputTypeDict:
+        return {
+            "required": {
+                "input_folder": (IO.STRING, {"default": "", "tooltip": "输入文件夹路径或从其他节点连接"}),
+                "start_video": (IO.STRING, {"default": "", "tooltip": "开始视频文件路径"}),
+                "output_folder": (IO.STRING, {"default": "video_prepend_output", "tooltip": "输出文件夹名称"}),
+                "max_workers": (IO.INT, {"default": 4, "min": 1, "max": 30, "tooltip": "处理线程数"}),
+            }
+        }
+    
+    RETURN_TYPES = (IO.STRING,)
+    RETURN_NAMES = ("output_path",)
+    FUNCTION = "execute"
+    OUTPUT_NODE = True
+    
+    def execute(self, input_folder: str, start_video: str, output_folder: str, max_workers: int):
+        """执行视频添加开始处理"""
+        try:
+            # 解析输入路径
+            input_folder_path = _resolve_input_path(input_folder)
+            
+            # 获取开始视频路径
+            if not start_video or start_video.strip() == "":
+                return ("",)
+            
+
+            
+            # 直接使用输入的路径
+            if not os.path.exists(start_video):
+                print(f"开始视频文件不存在: {start_video}")
+                return ("",)
+            
+            if len(os.listdir(start_video)) == 0:
+                print(f"开始视频文件夹为空: {start_video}")
+                return ("",)
+            
+            # 创建输出目录
+            output_dir = folder_paths.get_output_directory()
+            batch_output_dir = os.path.join(output_dir, output_folder)
+            os.makedirs(batch_output_dir, exist_ok=True)
+            
+            # 执行批量视频处理
+            prepend_start_to_videos_folder(input_folder_path, start_video, batch_output_dir, max_workers)
+            
+            return (batch_output_dir,)
+            
+        except ValueError as e:
+            # 输入验证错误
+            return ("",)
+        except Exception as e:
+            # 其他错误
+            print(f"处理视频时发生错误: {str(e)}")
+            return ("",)
+
+
 # ComfyUI节点映射
 NODE_CLASS_MAPPINGS = {
     "VideoCutNode": VideoCutNode,
     "VideoAppendEndNode": VideoAppendEndNode,
+    "VideoPrependStartNode": VideoPrependStartNode,
     "VideoJsonProcessNode": VideoJsonProcessNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VideoCutNode": "视频切分节点",
-    "VideoAppendEndNode": "视频添加结尾节点", 
+    "VideoAppendEndNode": "视频添加结尾节点",
+    "VideoPrependStartNode": "视频添加开始节点", 
     "VideoJsonProcessNode": "视频JSON处理节点",
 }
